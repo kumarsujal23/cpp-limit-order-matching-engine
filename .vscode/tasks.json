@@ -1,0 +1,54 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "CMake Configure",
+      "type": "shell",
+      "command": "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release",
+      "problemMatcher": []
+    },
+    {
+      "label": "Build All",
+      "type": "shell",
+      "command": "cmake --build build -j",
+      "group": { "kind": "build", "isDefault": true },
+      "dependsOn": ["CMake Configure"],
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Run: trading_engine",
+      "type": "shell",
+      "command": "./build/trading_engine",
+      "dependsOn": ["Build All"],
+      "problemMatcher": []
+    },
+    {
+      "label": "Run: concurrency_demo",
+      "type": "shell",
+      "command": "./build/concurrency_demo",
+      "dependsOn": ["Build All"],
+      "problemMatcher": []
+    },
+    {
+      "label": "Run: simd_demo",
+      "type": "shell",
+      "command": "./build/simd_demo",
+      "dependsOn": ["Build All"],
+      "problemMatcher": []
+    },
+    {
+      "label": "Run: benchmark",
+      "type": "shell",
+      "command": "./build/benchmark",
+      "dependsOn": ["Build All"],
+      "problemMatcher": []
+    },
+    {
+      "label": "Run: tests",
+      "type": "shell",
+      "command": "./build/tests",
+      "dependsOn": ["Build All"],
+      "problemMatcher": []
+    }
+  ]
+}
