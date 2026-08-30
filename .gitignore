@@ -3,3 +3,8 @@ build/
 *.out
 compile_commands.json
 .cache/
+/RESULTS.md
+/RESUME.md
+/ARCHITECTURE.md
+/INTERVIEW.md
+/db

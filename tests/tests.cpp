@@ -2,6 +2,7 @@
 #include "Engine.h"
 #include "OrderBook.h"
 #include "OrderFactory.h"
+#include "IJournal.h"
 
 TEST(no_match_when_resting_alone) {
     OrderBook book;
@@ -164,6 +165,170 @@ TEST(duplicate_active_order_ids_are_rejected) {
         rejected = true;
     }
     CHECK(rejected);
+}
+
+// ---------------------------------------------------------------------
+// Crash-recovery tests. These use InMemoryJournal (a test double) so the exact
+// append -> loadAll -> replay path used by PostgresJournal is exercised with
+// zero external dependencies - i.e. recovery correctness is proven even on a
+// machine with no database installed.
+// ---------------------------------------------------------------------
+TEST(recovery_rebuilds_resting_orders_trades_and_cancels) {
+    InMemoryJournal journal;
+
+    // --- First "process lifetime": run some commands, then go down. ---
+    std::vector<Trade> beforeCrash;
+    {
+        Engine engine;
+        engine.setJournal(&journal);
+        engine.start();
+
+        engine.submitOrder(OrderFactory::createOrder(OrderKind::LIMIT, 1, 1, Side::SELL, 10, 100.0));
+        engine.submitOrder(OrderFactory::createOrder(OrderKind::LIMIT, 2, 2, Side::BUY,   4, 100.0)); // trades 4, leaves 6 resting
+        engine.submitOrder(OrderFactory::createOrder(OrderKind::LIMIT, 3, 1, Side::SELL,  5, 101.0)); // rests at 101
+        engine.cancelOrder(3);                                                                        // ...then cancelled
+        engine.stop();
+
+        beforeCrash = engine.getTradeLog();
+    }
+    CHECK_EQ(beforeCrash.size(), 1u);           // exactly one trade happened
+    CHECK_EQ(beforeCrash[0].quantity, 4);
+    CHECK(journal.size() == 4u);                // 3 submits + 1 cancel journaled
+
+    // --- Second "process lifetime": fresh engine, SAME journal, recover. ---
+    Engine recovered;
+    recovered.setJournal(&journal);
+    recovered.recover();
+
+    // The recovered trade log must match exactly what happened before.
+    std::vector<Trade> afterRecover = recovered.getTradeLog();
+    CHECK_EQ(afterRecover.size(), beforeCrash.size());
+    CHECK_EQ(afterRecover[0].buyOrderId, beforeCrash[0].buyOrderId);
+    CHECK_EQ(afterRecover[0].sellOrderId, beforeCrash[0].sellOrderId);
+    CHECK_EQ(afterRecover[0].quantity, beforeCrash[0].quantity);
+    CHECK_EQ(afterRecover[0].price, beforeCrash[0].price);
+
+    // Prove the BOOK state was rebuilt too: order #1 should still be resting
+    // with 6 shares left at 100, and order #3 must be gone (it was cancelled).
+    recovered.start();
+    recovered.submitOrder(OrderFactory::createOrder(OrderKind::LIMIT, 4, 3, Side::BUY, 6, 100.0)); // should hit the resting 6 @100
+    recovered.submitOrder(OrderFactory::createOrder(OrderKind::LIMIT, 5, 3, Side::BUY, 5, 101.0)); // nothing at 101 (cancelled) -> rests, no trade
+    recovered.stop();
+
+    std::vector<Trade> finalLog = recovered.getTradeLog();
+    CHECK_EQ(finalLog.size(), 2u);               // the original trade + the new 6-share fill
+    CHECK_EQ(finalLog[1].buyOrderId, 4u);
+    CHECK_EQ(finalLog[1].sellOrderId, 1u);        // matched the recovered resting order
+    CHECK_EQ(finalLog[1].quantity, 6);
+    CHECK_EQ(finalLog[1].price, 100.0);
+}
+
+TEST(recovery_from_empty_journal_is_a_noop) {
+    InMemoryJournal journal;
+    Engine engine;
+    engine.setJournal(&journal);
+    engine.recover();                            // nothing to replay
+    CHECK_EQ(engine.getTradeLog().size(), 0u);
+
+    // Engine is still perfectly usable after an empty recovery.
+    engine.start();
+    engine.submitOrder(OrderFactory::createOrder(OrderKind::LIMIT, 1, 1, Side::SELL, 5, 100.0));
+    engine.submitOrder(OrderFactory::createOrder(OrderKind::LIMIT, 2, 2, Side::BUY,  5, 100.0));
+    engine.stop();
+    CHECK_EQ(engine.getTradeLog().size(), 1u);
+}
+
+// The journal must record INPUT commands in order, with correct fields - this
+// is what makes deterministic replay possible in the first place.
+TEST(journal_records_commands_in_seq_order_with_correct_fields) {
+    InMemoryJournal journal;
+    {
+        Engine engine;
+        engine.setJournal(&journal);
+        engine.start();
+        engine.submitOrder(OrderFactory::createOrder(OrderKind::LIMIT, 100, 7, Side::SELL, 12, 99.5));
+        engine.cancelOrder(100);
+        engine.stop();
+    }
+
+    std::vector<JournalEvent> log = journal.loadAll();
+    CHECK_EQ(log.size(), 2u);
+
+    // Event 0: the SUBMIT, with every field preserved.
+    CHECK_EQ(log[0].seq, 1u);                       // sequence numbers start at 1
+    CHECK(log[0].type == CommandType::SUBMIT);
+    CHECK(log[0].kind == OrderKind::LIMIT);
+    CHECK(log[0].side == Side::SELL);
+    CHECK_EQ(log[0].orderId, 100u);
+    CHECK_EQ(log[0].traderId, 7u);
+    CHECK_EQ(log[0].quantity, 12);
+    CHECK_EQ(log[0].price, 99.5);
+
+    // Event 1: the CANCEL, one higher in sequence, targeting the same id.
+    CHECK_EQ(log[1].seq, 2u);
+    CHECK(log[1].type == CommandType::CANCEL);
+    CHECK_EQ(log[1].orderId, 100u);
+}
+
+// Replaying the SAME log into two independent engines must produce identical
+// results - determinism is the whole premise of event-sourced recovery.
+TEST(recovery_is_deterministic_across_engines) {
+    InMemoryJournal journal;
+    {
+        Engine engine;
+        engine.setJournal(&journal);
+        engine.start();
+        engine.submitOrder(OrderFactory::createOrder(OrderKind::LIMIT, 1, 1, Side::SELL, 10, 100.0));
+        engine.submitOrder(OrderFactory::createOrder(OrderKind::LIMIT, 2, 2, Side::SELL,  5, 101.0));
+        engine.submitOrder(OrderFactory::createOrder(OrderKind::LIMIT, 3, 3, Side::BUY,  12, 101.0)); // sweeps 10@100 then 2@101
+        engine.stop();
+    }
+
+    Engine a, b;
+    a.setJournal(&journal);
+    b.setJournal(&journal);
+    a.recover();
+    b.recover();
+
+    std::vector<Trade> la = a.getTradeLog();
+    std::vector<Trade> lb = b.getTradeLog();
+    CHECK_EQ(la.size(), lb.size());
+    for (std::size_t i = 0; i < la.size(); ++i) {
+        CHECK_EQ(la[i].buyOrderId, lb[i].buyOrderId);
+        CHECK_EQ(la[i].sellOrderId, lb[i].sellOrderId);
+        CHECK_EQ(la[i].quantity, lb[i].quantity);
+        CHECK_EQ(la[i].price, lb[i].price);
+    }
+    // sanity: that crossing order really did generate two fills
+    CHECK_EQ(la.size(), 2u);
+}
+
+// Market orders carry no price (stored as 0 in the journal). Recovery must
+// rebuild them correctly via the factory's market path.
+TEST(recovery_replays_market_orders) {
+    InMemoryJournal journal;
+    {
+        Engine engine;
+        engine.setJournal(&journal);
+        engine.start();
+        engine.submitOrder(OrderFactory::createOrder(OrderKind::LIMIT, 1, 1, Side::SELL, 10, 100.0));
+        engine.submitOrder(OrderFactory::createOrder(OrderKind::MARKET, 2, 2, Side::BUY, 6)); // market buy
+        engine.stop();
+    }
+    // The submitted market order was journaled as kind=MARKET, price=0.
+    CHECK(journal.loadAll()[1].kind == OrderKind::MARKET);
+    CHECK_EQ(journal.loadAll()[1].price, 0.0);
+
+    Engine recovered;
+    recovered.setJournal(&journal);
+    recovered.recover();
+
+    std::vector<Trade> log = recovered.getTradeLog();
+    CHECK_EQ(log.size(), 1u);
+    CHECK_EQ(log[0].buyOrderId, 2u);
+    CHECK_EQ(log[0].sellOrderId, 1u);
+    CHECK_EQ(log[0].quantity, 6);
+    CHECK_EQ(log[0].price, 100.0); // market buy executes at the resting ask
 }
 
 int main() {

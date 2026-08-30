@@ -1,8 +1,6 @@
 #include "Order.h"
 #include "OrderFactory.h"
 #include "OrderBook.h"
-#include "Stock.h"
-#include "Trader.h"
 #include <iostream>
 
 void printTrade(const Trade& t) {

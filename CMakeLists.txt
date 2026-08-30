@@ -80,3 +80,50 @@ endif()
 # manually invoking ./tests - standard for any CMake project with tests.
 enable_testing()
 add_test(NAME unit_tests COMMAND tests)
+
+# ---------------------------------------------------------------------
+# OPTIONAL persistence layer: PostgreSQL journal (libpqxx) + Redis market
+# data (hiredis). These need external libraries, so they are GUARDED behind a
+# dependency check - the whole core project above still builds and tests even
+# on a machine with no database libraries installed. (That separation is the
+# point of the IJournal / IMarketDataSink interfaces.)
+#
+# To enable on Ubuntu/WSL:   sudo apt install libpqxx-dev libhiredis-dev
+# ---------------------------------------------------------------------
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(LIBPQXX IMPORTED_TARGET libpqxx)
+    pkg_check_modules(HIREDIS IMPORTED_TARGET hiredis)
+endif()
+
+if(LIBPQXX_FOUND AND HIREDIS_FOUND)
+    message(STATUS "Persistence targets ENABLED (found libpqxx + hiredis)")
+
+    # Build the two adapters once as their own static library, layered on top
+    # of engine_core (they implement engine_core's interfaces).
+    add_library(engine_persistence STATIC
+        persistence/PostgresJournal.cpp
+        persistence/RedisMarketData.cpp)
+    target_include_directories(engine_persistence PUBLIC include persistence)
+    target_link_libraries(engine_persistence
+        PUBLIC engine_core PkgConfig::LIBPQXX PkgConfig::HIREDIS)
+    if(MSVC)
+        target_compile_options(engine_persistence PRIVATE /W4)
+    else()
+        target_compile_options(engine_persistence PRIVATE -Wall -Wextra)
+    endif()
+
+    # End-to-end persistence + crash-recovery demo (needs Postgres + Redis up).
+    add_executable(persistence_demo demos/persistence_demo.cpp)
+    target_link_libraries(persistence_demo PRIVATE engine_persistence)
+    if(MSVC)
+        target_compile_options(persistence_demo PRIVATE /W4)
+    else()
+        target_compile_options(persistence_demo PRIVATE -Wall -Wextra)
+    endif()
+else()
+    message(STATUS
+        "Persistence targets DISABLED - install libpqxx-dev + libhiredis-dev "
+        "to build PostgresJournal/RedisMarketData and the persistence_demo. "
+        "The core engine, tests, benchmark and demos still build without them.")
+endif()

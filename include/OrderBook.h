@@ -78,5 +78,4 @@ private:
     // --- internal helpers, implemented in the .cpp ---
     std::vector<Trade> matchIncoming(Order* incoming);
     void restInBook(Order* incoming); // add a still-open LIMIT order to the book
-    void removeFromLevel(OrderId id); // erase bookkeeping for a filled/cancelled order
 };

@@ -20,6 +20,15 @@ enum class OrderKind {
     LIMIT
 };
 
+// The two things a trader can ask the engine to do. Every input the engine
+// processes is one of these, and every input is written to the journal in the
+// exact order it was processed - that ordered stream of commands is what makes
+// deterministic crash recovery possible (see IJournal.h / Engine::recover()).
+enum class CommandType {
+    SUBMIT,  // add a new order to the book
+    CANCEL   // remove a resting order by id
+};
+
 enum class OrderStatus {
     NEW,             // just created, not yet in the book
     OPEN,            // resting in the book, unfilled or partially filled
